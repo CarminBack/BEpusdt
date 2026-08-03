@@ -14,6 +14,9 @@ func bscInit() {
 	ctx := context.Background()
 	bsc := evm{
 		Network: conf.Bsc,
+		Contracts: []string{
+			conf.UsdtBep20,
+		},
 		Block: block{
 			ConfirmedOffset: 15,
 		},

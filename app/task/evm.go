@@ -3,6 +3,7 @@ package task
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -45,6 +46,7 @@ type evm struct {
 	Network        string
 	Block          block
 	Native         evmNative
+	Contracts      []string // ERC-20 contracts to include in log scans; empty means all contracts
 	Client         *http.Client
 	AvgBlockTime   int64 // 平均出块时间，单位秒；一个大概值，用于计算首次启动时需要回溯的区块数量，尽量准确设置，默认1秒一个区块
 	blockScanQueue *chanx.UnboundedChan[evmBlock]
@@ -323,7 +325,10 @@ func (e *evm) parseNativeTransfer(array []gjson.Result, num int, timestamp time.
 
 func (e *evm) parseEventTransfer(b evmBlock, timestamp map[string]time.Time) ([]transfer, error) {
 	transfers := make([]transfer, 0)
-	post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x","topics":["%s"]}],"id":1}`, b.From, b.To, evmTransferEvent))
+	post, err := e.buildLogsRequest(b)
+	if err != nil {
+		return transfers, errors.Join(errors.New("eth_getLogs request encode error"), err)
+	}
 	resp, err := e.Client.Post(e.rpcEndpoint(), "application/json", bytes.NewBuffer(post))
 	if err != nil {
 
@@ -384,6 +389,34 @@ func (e *evm) parseEventTransfer(b evmBlock, timestamp map[string]time.Time) ([]
 	}
 
 	return transfers, nil
+}
+
+func (e *evm) buildLogsRequest(b evmBlock) ([]byte, error) {
+	filter := struct {
+		FromBlock string   `json:"fromBlock"`
+		ToBlock   string   `json:"toBlock"`
+		Address   []string `json:"address,omitempty"`
+		Topics    []string `json:"topics"`
+	}{
+		FromBlock: fmt.Sprintf("0x%x", b.From),
+		ToBlock:   fmt.Sprintf("0x%x", b.To),
+		Address:   e.Contracts,
+		Topics:    []string{evmTransferEvent},
+	}
+
+	request := struct {
+		JSONRPC string        `json:"jsonrpc"`
+		Method  string        `json:"method"`
+		Params  []interface{} `json:"params"`
+		ID      int           `json:"id"`
+	}{
+		JSONRPC: "2.0",
+		Method:  "eth_getLogs",
+		Params:  []interface{}{filter},
+		ID:      1,
+	}
+
+	return json.Marshal(request)
 }
 
 func (e *evm) tradeConfirmHandle(ctx context.Context) {
