@@ -8,6 +8,7 @@ WORKDIR /web
 COPY web/package.json web/pnpm-lock.yaml ./
 
 RUN pnpm install --frozen-lockfile --shamefully-hoist --dangerously-allow-all-builds
+RUN pnpm config set dangerously-allow-all-builds true
 
 COPY web/ ./
 RUN pnpm run build:prod
