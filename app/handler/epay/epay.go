@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
@@ -16,6 +17,8 @@ import (
 )
 
 const Pid = "1000" // 固定商户号
+
+const usdtBep20Alias = "usdt_bep20"
 
 type Epay struct {
 }
@@ -69,6 +72,8 @@ func (e Epay) Submit(ctx *gin.Context) {
 		return
 	}
 
+	data.Type = normalizeTradeType(data.Type)
+
 	if !utils.IsAllowedCallbackURL(data.NotifyURL) {
 		ctx.String(200, "notify_url 地址不合法")
 
@@ -107,10 +112,7 @@ func (e Epay) Submit(ctx *gin.Context) {
 	}
 
 	// 解析请求地址
-	var host = "http://" + ctx.Request.Host
-	if ctx.Request.TLS != nil {
-		host = "https://" + ctx.Request.Host
-	}
+	var host = requestScheme(ctx.Request) + "://" + ctx.Request.Host
 
 	ctx.Redirect(http.StatusFound, model.CheckoutCounter(host, order.TradeId))
 }
@@ -155,11 +157,29 @@ func (e Epay) verify(data map[string]string) (submit, error) {
 	fiat, ok := data["fiat"]
 	if ok && fiat != "" {
 		params.Fiat = model.Fiat(fiat)
+	} else if params.Type == usdtBep20Alias {
+		params.Fiat = model.USD
 	} else {
 		params.Fiat = model.CNY
 	}
 
 	return params, nil
+}
+
+func normalizeTradeType(tradeType string) string {
+	if tradeType == usdtBep20Alias {
+		return string(model.UsdtBep20)
+	}
+
+	return tradeType
+}
+
+func requestScheme(req *http.Request) string {
+	if req.TLS != nil || strings.EqualFold(strings.TrimSpace(req.Header.Get("X-Forwarded-Proto")), "https") {
+		return "https"
+	}
+
+	return "http"
 }
 
 func (e Epay) sign(data map[string]string, token string) string {
