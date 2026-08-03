@@ -2,6 +2,7 @@ FROM node:25.2.1 AS web_builder
 
 # 安装 pnpm
 RUN npm install -g pnpm
+ENV CI=true
 
 WORKDIR /web
 COPY web/package.json web/pnpm-lock.yaml ./
