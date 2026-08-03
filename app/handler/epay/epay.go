@@ -72,7 +72,7 @@ func (e Epay) Submit(ctx *gin.Context) {
 		return
 	}
 
-	data.Type = normalizeTradeType(data.Type)
+	data.Type = NormalizeTradeType(data.Type)
 
 	if !utils.IsAllowedCallbackURL(data.NotifyURL) {
 		ctx.String(200, "notify_url 地址不合法")
@@ -166,7 +166,10 @@ func (e Epay) verify(data map[string]string) (submit, error) {
 	return params, nil
 }
 
-func normalizeTradeType(tradeType string) string {
+// NormalizeTradeType maps compatibility aliases to the canonical trade type.
+// Both EasyPay and the native JSON API use this mapping so aliases behave
+// consistently regardless of which entry point creates the order.
+func NormalizeTradeType(tradeType string) string {
 	if tradeType == usdtBep20Alias {
 		return string(model.UsdtBep20)
 	}

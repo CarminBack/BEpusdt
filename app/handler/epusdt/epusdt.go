@@ -289,6 +289,7 @@ func (Epusdt) CreateTransaction(ctx *gin.Context) {
 	if req.TradeType == "" {
 		req.TradeType = string(model.UsdtTrc20)
 	}
+	req.TradeType = epay.NormalizeTradeType(req.TradeType)
 
 	order, err := model.StartBuildOrder(model.OrderParams{
 		Money:         decimal.NewFromFloat(req.Amount),

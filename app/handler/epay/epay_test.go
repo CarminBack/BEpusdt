@@ -8,11 +8,11 @@ import (
 )
 
 func TestNormalizeTradeType(t *testing.T) {
-	if got := normalizeTradeType(usdtBep20Alias); got != string(model.UsdtBep20) {
-		t.Fatalf("normalizeTradeType() = %q, want %q", got, model.UsdtBep20)
+	if got := NormalizeTradeType(usdtBep20Alias); got != string(model.UsdtBep20) {
+		t.Fatalf("NormalizeTradeType() = %q, want %q", got, model.UsdtBep20)
 	}
-	if got := normalizeTradeType(string(model.UsdtTrc20)); got != string(model.UsdtTrc20) {
-		t.Fatalf("normalizeTradeType() changed existing type to %q", got)
+	if got := NormalizeTradeType(string(model.UsdtTrc20)); got != string(model.UsdtTrc20) {
+		t.Fatalf("NormalizeTradeType() changed existing type to %q", got)
 	}
 }
 
