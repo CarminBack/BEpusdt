@@ -48,8 +48,10 @@ type evm struct {
 	Native         evmNative
 	Contracts      []string // ERC-20 contracts to include in log scans; empty means all contracts
 	Client         *http.Client
-	AvgBlockTime   int64 // 平均出块时间，单位秒；一个大概值，用于计算首次启动时需要回溯的区块数量，尽量准确设置，默认1秒一个区块
+	AvgBlockTime   time.Duration // 平均出块时间；用于计算首次启动时需要回溯的区块数量，默认1秒
 	blockScanQueue *chanx.UnboundedChan[evmBlock]
+	rpcMu          sync.Mutex
+	rpcIndex       int
 }
 
 type evmBlock struct {
@@ -64,8 +66,10 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 	}
 
 	post := []byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}`)
-	req, err := http.NewRequestWithContext(ctx, "POST", e.rpcEndpoint(), bytes.NewBuffer(post))
+	endpoint := e.rpcEndpoint()
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(post))
 	if err != nil {
+		e.rotateRpcEndpoint(endpoint)
 		log.Task.Warn("Error creating request:", err)
 
 		return
@@ -74,6 +78,7 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := e.Client.Do(req)
 	if err != nil {
+		e.rotateRpcEndpoint(endpoint)
 		log.Task.Warn("Error sending request:", err)
 
 		return
@@ -83,13 +88,15 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		e.rotateRpcEndpoint(endpoint)
 		log.Task.Warn("Error reading response body:", err)
 
 		return
 	}
 
 	var res = gjson.ParseBytes(body)
-	if !res.IsObject() {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || !res.IsObject() || res.Get("error").Exists() {
+		e.rotateRpcEndpoint(endpoint)
 		log.Task.Warn(fmt.Sprintf("EVM 数据解析错误(%s): %s", e.Network, string(body)))
 
 		return
@@ -131,10 +138,6 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 }
 
 func (e *evm) syncBlocksBackward(now int64) {
-	if e.AvgBlockTime <= 0 { // 未设置平均出块时间，默认1秒一个
-		e.AvgBlockTime = 1
-	}
-
 	var o model.Order
 	trade := model.GetNetworkTrades(model.Network(e.Network))
 	model.Db.Model(&model.Order{}).Where("status = ? and trade_type in (?)", model.OrderStatusWaiting, trade).Order("created_at asc").Limit(1).Find(&o)
@@ -143,7 +146,7 @@ func (e *evm) syncBlocksBackward(now int64) {
 		return
 	}
 
-	sub := ((time.Now().Unix() - o.CreatedAt.Time().Unix()) / e.AvgBlockTime) + 30 //计算需要回溯的区块数量，同时冗余30个区块
+	sub := e.lookbackBlockCount(o.CreatedAt.Time(), time.Now())
 	start := now - sub
 
 	go func() {
@@ -208,8 +211,10 @@ func (e *evm) getBlockByNumber(a any) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", e.rpcEndpoint(), bytes.NewBuffer([]byte(fmt.Sprintf(`[%s]`, strings.Join(items, ",")))))
+	endpoint := e.rpcEndpoint()
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer([]byte(fmt.Sprintf(`[%s]`, strings.Join(items, ",")))))
 	if err != nil {
+		e.rotateRpcEndpoint(endpoint)
 		log.Task.Warn("Error creating request:", err)
 
 		return
@@ -218,6 +223,7 @@ func (e *evm) getBlockByNumber(a any) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := e.Client.Do(req)
 	if err != nil {
+		e.rotateRpcEndpoint(endpoint)
 		conf.RecordFailure(e.Network)
 		e.blockScanQueue.In <- b
 		log.Task.Warn("eth_getBlockByNumber Error sending request:", err)
@@ -229,9 +235,20 @@ func (e *evm) getBlockByNumber(a any) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		e.rotateRpcEndpoint(endpoint)
 		conf.RecordFailure(e.Network)
 		e.blockScanQueue.In <- b
 		log.Task.Warn("eth_getBlockByNumber Error reading response body:", err)
+
+		return
+	}
+
+	data := gjson.ParseBytes(body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || !data.IsArray() {
+		e.rotateRpcEndpoint(endpoint)
+		conf.RecordFailure(e.Network)
+		e.blockScanQueue.In <- b
+		log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber invalid response: %s", e.Network, string(body)))
 
 		return
 	}
@@ -240,8 +257,9 @@ func (e *evm) getBlockByNumber(a any) {
 
 	nativeTransfers := make([]transfer, 0)
 	blockTimestamp := make(map[string]time.Time)
-	for _, itm := range gjson.ParseBytes(body).Array() {
+	for _, itm := range data.Array() {
 		if itm.Get("error").Exists() {
+			e.rotateRpcEndpoint(endpoint)
 			conf.RecordFailure(e.Network)
 			e.blockScanQueue.In <- b
 			log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber response error %s", e.Network, itm.Get("error").String()))
@@ -329,8 +347,20 @@ func (e *evm) parseEventTransfer(b evmBlock, timestamp map[string]time.Time) ([]
 	if err != nil {
 		return transfers, errors.Join(errors.New("eth_getLogs request encode error"), err)
 	}
-	resp, err := e.Client.Post(e.rpcEndpoint(), "application/json", bytes.NewBuffer(post))
+	endpoint := e.rpcEndpoint()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(post))
 	if err != nil {
+		e.rotateRpcEndpoint(endpoint)
+
+		return transfers, errors.Join(errors.New("eth_getLogs request error"), err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := e.Client.Do(req)
+	if err != nil {
+		e.rotateRpcEndpoint(endpoint)
 
 		return transfers, errors.Join(errors.New("eth_getLogs Post Error"), err)
 	}
@@ -339,14 +369,16 @@ func (e *evm) parseEventTransfer(b evmBlock, timestamp map[string]time.Time) ([]
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		e.rotateRpcEndpoint(endpoint)
 
 		return transfers, errors.Join(errors.New("eth_getLogs ReadAll Error"), err)
 	}
 
 	data := gjson.ParseBytes(body)
-	if data.Get("error").Exists() {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || !data.IsObject() || data.Get("error").Exists() {
+		e.rotateRpcEndpoint(endpoint)
 
-		return transfers, errors.New(fmt.Sprintf("%s eth_getLogs response error %s", e.Network, data.Get("error").String()))
+		return transfers, fmt.Errorf("%s eth_getLogs response error: %s", e.Network, string(body))
 	}
 
 	for _, itm := range data.Get("result").Array() {
@@ -435,8 +467,10 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 		}
 
 		post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["%s"],"id":1}`, o.RefHash))
-		req, err := http.NewRequestWithContext(ctx, "POST", e.rpcEndpoint(), bytes.NewBuffer(post))
+		endpoint := e.rpcEndpoint()
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(post))
 		if err != nil {
+			e.rotateRpcEndpoint(endpoint)
 			log.Task.Warn("evm tradeConfirmHandle Error creating request:", err)
 
 			return
@@ -445,6 +479,7 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := e.Client.Do(req)
 		if err != nil {
+			e.rotateRpcEndpoint(endpoint)
 			log.Task.Warn("evm tradeConfirmHandle Error sending request:", err)
 
 			return
@@ -454,13 +489,15 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
+			e.rotateRpcEndpoint(endpoint)
 			log.Task.Warn("evm tradeConfirmHandle Error reading response body:", err)
 
 			return
 		}
 
 		data := gjson.ParseBytes(body)
-		if data.Get("error").Exists() {
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || !data.IsObject() || data.Get("error").Exists() {
+			e.rotateRpcEndpoint(endpoint)
 			log.Task.Warn(fmt.Sprintf("%s eth_getTransactionReceipt response error %s", e.Network, data.Get("error").String()))
 
 			return
@@ -483,8 +520,87 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 }
 
 func (e *evm) rpcEndpoint() string {
+	return e.currentRpcEndpoint(e.rpcEndpoints())
+}
 
-	return model.Endpoint(model.Network(e.Network))
+func (e *evm) rpcEndpoints() []string {
+	return splitRpcEndpoints(model.Endpoint(model.Network(e.Network)))
+}
+
+func splitRpcEndpoints(raw string) []string {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	})
+	endpoints := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		endpoint := strings.TrimSpace(part)
+		if endpoint == "" {
+			continue
+		}
+		if _, ok := seen[endpoint]; ok {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		endpoints = append(endpoints, endpoint)
+	}
+
+	return endpoints
+}
+
+func (e *evm) currentRpcEndpoint(endpoints []string) string {
+	if len(endpoints) == 0 {
+		return ""
+	}
+
+	e.rpcMu.Lock()
+	defer e.rpcMu.Unlock()
+	if e.rpcIndex >= len(endpoints) {
+		e.rpcIndex = 0
+	}
+
+	return endpoints[e.rpcIndex]
+}
+
+func (e *evm) rotateRpcEndpoint(failed string) {
+	endpoints := e.rpcEndpoints()
+	_, ok := e.rotateRpcEndpointIn(endpoints, failed)
+	if !ok {
+		return
+	}
+	log.Task.Warn(fmt.Sprintf("%s RPC 节点自动切换至下一备用节点（共 %d 个）", e.Network, len(endpoints)))
+}
+
+func (e *evm) rotateRpcEndpointIn(endpoints []string, failed string) (string, bool) {
+	if len(endpoints) < 2 {
+		return "", false
+	}
+
+	e.rpcMu.Lock()
+	defer e.rpcMu.Unlock()
+	if e.rpcIndex >= len(endpoints) {
+		e.rpcIndex = 0
+	}
+	if endpoints[e.rpcIndex] != failed {
+		return "", false
+	}
+
+	e.rpcIndex = (e.rpcIndex + 1) % len(endpoints)
+
+	return endpoints[e.rpcIndex], true
+}
+
+func (e *evm) lookbackBlockCount(createdAt, now time.Time) int64 {
+	avgBlockTime := e.AvgBlockTime
+	if avgBlockTime <= 0 {
+		avgBlockTime = time.Second
+	}
+	age := now.Sub(createdAt)
+	if age < 0 {
+		age = 0
+	}
+
+	return int64(age/avgBlockTime) + 30
 }
 
 func syncBreak(network string, num int) bool {

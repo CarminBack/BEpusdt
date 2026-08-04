@@ -25,6 +25,7 @@ func bscInit() {
 			Decimal:   conf.BscBnbDecimals,
 			TradeType: model.BscBnb,
 		},
+		AvgBlockTime:   750 * time.Millisecond,
 		Client:         utils.NewHttpClient(),
 		blockScanQueue: chanx.NewUnboundedChan[evmBlock](ctx, 30),
 	}
