@@ -1,7 +1,5 @@
 name: docker-nightly
 on:
-  schedule:
-    - cron: '0 16 * * *'
   workflow_dispatch:
 env:
   APP_NAME: bepusdt
